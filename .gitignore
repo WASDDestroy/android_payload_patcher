@@ -1,1 +1,15 @@
 *.pyc
+
+# OTA zips unpacked by ota_zip_merge.sh (placeholders stay tracked)
+/base/payload.bin
+/base/META-INF/
+/base/*.pb
+/base/payload_properties.txt
+/delta/payload.bin
+/delta/META-INF/
+/delta/*.pb
+/delta/payload_properties.txt
+
+# merge output
+/delta_out/*.zip
+/delta_out/work/
