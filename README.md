@@ -21,7 +21,7 @@ Android A/B OTA payload 工具包，将基准 payload 进行增量包补丁后�
 - `--out_zip`：输出包，默认 `delta_out/<增量包的 post-build-incremental>.zip`（取不到时退到 `post-build`，再不行就用 `merged_ota.zip`）
 - `--dry_run`：只做参数检查和解压，打印将要执行的主脚本命令，不真正合并
 
-包装脚本会先把基准 ZIP 解到 `base/`、增量 ZIP 解到 `delta/`（同名文件覆盖写，可以反复跑），检查 `payload.bin` 和 delta 需要的 4 个元数据文件都在，然后按 `ota_delta_to_full.sh BASE_PAYLOAD DELTA_PAYLOAD DELTA_DIR OUT_ZIP` 拉起主脚本。Windows 路径可以直接写（`F:\dir\file.zip` 自动映射成 `/mnt/f/dir/file.zip`），路径带空格也没问题。
+包装脚本会优先检测两个 ZIP 中的 `payload.bin` 是否为 `ZIP_STORED` 未压缩存储：若是则直接通过 `--payload_offset` 原地读取并把增量所需的 4 个小元数据文件解入主脚本临时工作目录，**不会在 `base/` 或 `delta/` 下留下任何文件**；仅当检测到压缩条目时才回退解压。随后按 `ota_delta_to_full.sh BASE_PAYLOAD DELTA_PAYLOAD DELTA_DIR OUT_ZIP` 拉起主脚本。Windows 路径可以直接写（`F:\dir\file.zip` 自动映射成 `/mnt/f/dir/file.zip`），路径带空格也没问题。
 
 也可以跳过包装脚本，直接调用主脚本：
 
@@ -31,21 +31,21 @@ Android A/B OTA payload 工具包，将基准 payload 进行增量包补丁后�
 ./ota_delta_to_full.sh base/payload.bin delta/payload.bin delta out/TB710FU_ZUXOS_2.5.02.089.zip
 ```
 
-- BASE_PAYLOAD：旧版本的**完整** OTA payload
-- DELTA_PAYLOAD：增量 payload
-- DELTA_DIR：delta OTA 解包目录，需要含 `META-INF/com/android/metadata`、`META-INF/com/android/metadata.pb`、`apex_info.pb`、`care_map.pb`
-- OUT_ZIP：输出包；中间产物写在 `$(dirname OUT_ZIP)/work/`（base 解包镜像、合并后镜像、payload.bin、properties、签名），跑完可删
+- BASE_PAYLOAD：旧版本的**完整** OTA payload（原始 `payload.bin` 或 `ZIP_STORED` 完整 OTA ZIP）
+- DELTA_PAYLOAD：增量 payload（原始 `payload.bin` 或 `ZIP_STORED` 增量 OTA ZIP）
+- DELTA_DIR：delta OTA 解包目录（需含 `META-INF/com/android/metadata`、`META-INF/com/android/metadata.pb`、`apex_info.pb`、`care_map.pb`），或直接传入增量 OTA ZIP 路径
+- OUT_ZIP：输出包；临时工作目录 `$(dirname OUT_ZIP)/work/` 会在退出或出错时自动清理（包括临时 `key.pem`、`tool.py` 与各类中间文件；如需保留排错可设置 `KEEP_WORK=1`）
 
-主脚本本身不校验参数、不打印进度、不处理错误，任一步失败直接退出（`ota_zip_merge.sh` 负责参数检查、解压和错误提示）。
+主脚本保留 VABC 元数据与压缩配置（不禁用 VABC），采用流式分块对 `payload.bin` 签名并打包进最终 ZIP（避免整包读入内存）；对 `/mnt/*`（9p）上的增量包会先将其小体积增量 payload 暂存到 Linux ext4 后再执行合并，并默认对第 2 步增量 `ota_extractor` 启用 `--single_thread`（可通过 `DELTA_EXTRACT_FLAGS` 覆盖）以控制内存峰值，同时在读写大文件过程中主动调用 `posix_fadvise(POSIX_FADV_DONTNEED)` 逐出干净的 Page Cache，并将 `delta_generator` 外层分区并行度默认设为 `1`（可通过环境变量 `DELTA_MAX_THREADS` 覆盖），让内层分块压缩吃满 `nproc` 核心且避免 `N × N` 嵌套线程池争抢。主脚本本身不校验参数、不打印进度、不处理错误，任一步失败直接退出（`ota_zip_merge.sh` 负责参数检查和错误提示）。
 
 ## 运行环境要求
 
 - x86_64 Linux（本包在 WSL2 Ubuntu 22.04 验证），二进制为动态链接，所需 .so 全部已内置
-- `sh` + coreutils（`head`、`stat`、`cut`、`sed`、`nproc`）、`unzip`（6.0+，包装脚本解压 OTA ZIP 用）
+- `sh` + coreutils（`cut`、`sed`、`nproc`）、`unzip`（6.0+，仅在遇到压缩载荷的回退解压或读取 ZIP 列表时用到）
 - `python3`（3.8+ 即可，protobuf 已内置纯 python 实现）
-- `openssl` 3.x（用到 `pkcs8` 与 `cms -sign`）
-- 磁盘：约 4 倍 payload 大小的空闲空间（base 镜像 + 合并镜像 + payload + zip）；用包装脚本时再加一份解压出来的 base payload，即约 5 倍
-- 内存：测试平台为 20 GiB RAM + 8 GiB swap, 低于此配置的机器不保证能成功合成。
+- `openssl` 3.x（用到 `pkcs8`、`pkeyutl -sign` 与 `cms -sign`）
+- 磁盘：约 2.5–3 倍目标 payload 大小的空闲空间（包装脚本默认不复制 `payload.bin`，主脚本在每步结束后即时清理中间目录并在退出时自动删除 `work/`）
+- 内存：流式签名、限制外层线程与主动逐出 Page Cache 后，进程峰值堆内存约为 1–2.5 GiB（不再需要 20 GiB RAM + 8 GiB swap）
 
 ## 产物校验
 
